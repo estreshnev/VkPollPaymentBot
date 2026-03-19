@@ -329,7 +329,7 @@ function renderCheckMessage({ pollTitle, stats, usersMap }) {
   lines.push('');
 
   if (stats.conflictUserIds.length === 0) {
-    lines.push('1) Конфликтов «Иду» + «Не иду» нет.');
+    lines.push('1) Проблем не обнаружено.');
   } else {
     lines.push('1) Нашел конфликт «Иду» + «Не иду» у:');
     for (const userId of stats.conflictUserIds) {
@@ -342,14 +342,14 @@ function renderCheckMessage({ pollTitle, stats, usersMap }) {
   if (stats.totalParticipants >= 12) {
     lines.push('Минимум 12 набрано.');
   } else {
-    lines.push(`До 12 не хватает: ${12 - stats.totalParticipants}.`);
+    lines.push(`Доберите ${12 - stats.totalParticipants} человек.`);
   }
 
   lines.push('');
   if (stats.totalParticipants > 12) {
     lines.push('3) У нас есть запас, если кто-то хочет отмениться — не забудьте оповестить запасного.');
   } else {
-    lines.push('3) Запаса пока нет.');
+    lines.push('3) Ок.');
   }
 
   return lines.join('\n');
