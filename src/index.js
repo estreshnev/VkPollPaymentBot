@@ -9,20 +9,26 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_FILE = path.resolve(__dirname, '../data/state.json');
+const ENV_FILE = path.resolve(__dirname, '../.env');
 
 const VK_TOKEN = process.env.VK_TOKEN;
 if (!VK_TOKEN) {
   throw new Error('VK_TOKEN is required in .env');
 }
-const VK_USER_TOKEN = process.env.VK_USER_TOKEN;
+let VK_USER_TOKEN = process.env.VK_USER_TOKEN;
 const DEBUG_EVENTS = process.env.DEBUG_EVENTS === '1';
+const BOT_ADMIN_USER_ID = Number.parseInt(process.env.BOT_ADMIN_USER_ID ?? '', 10) || 0;
+const VK_USER_TOKEN_AUTH_URL = (
+  process.env.VK_USER_TOKEN_AUTH_URL ||
+  'https://oauth.vk.com/authorize?client_id=6287487&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=polls,offline&response_type=token&v=5.199'
+).trim();
 const POLL_TRACKER_SYNC_MS = Math.max(
   10_000,
   Number.parseInt(process.env.POLL_TRACKER_SYNC_MS ?? '60000', 10) || 60_000
 );
 
 const vk = new VK({ token: VK_TOKEN });
-const vkUser = VK_USER_TOKEN ? new VK({ token: VK_USER_TOKEN }) : null;
+let vkUser = VK_USER_TOKEN ? new VK({ token: VK_USER_TOKEN }) : null;
 
 const ACTIONS = {
   PAY_SELF: 'pay_self',
@@ -36,12 +42,15 @@ const HELP_TEXT = [
   '/createGame <название> - создать игровой опрос',
   '/check - проверить опрос (команду отправлять ответом на сообщение с опросом)',
   '/getMoney <текст_оплаты> - запустить сбор по опросу (команду отправлять ответом на сообщение с опросом)',
+  '/update_token - получить OAuth ссылку для обновления токена',
+  '/update_token <url> - обновить VK_USER_TOKEN из итогового OAuth URL',
   '',
   'Как пользоваться:',
   '1) Создайте опрос через /createGame (или используйте уже готовый).',
   '2) Для быстрой проверки отправьте /check ответом на опрос.',
   '3) Для сбора денег отправьте /getMoney ответом на опрос.',
   '4) Бот автоматически напишет в чат, если человек вышел из пунктов Иду/+1/+2/+3.',
+  '5) В беседе /update_token может вызывать только BOT_ADMIN_USER_ID.',
   '',
   'Пример:',
   '/getMoney 500р перевод на 8-999-123-45-67'
@@ -101,6 +110,17 @@ function isCheckCommand(text) {
   return /^\/check(?:\s+.*)?$/i.test(text.trim());
 }
 
+function parseUpdateTokenCommand(text) {
+  const match = text.match(/^\/update_token(?:\s+(.+))?$/i);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    rawUrl: (match[1] ?? '').trim()
+  };
+}
+
 function extractPollAttachment(message) {
   if (!message || !Array.isArray(message.attachments)) {
     return null;
@@ -157,6 +177,64 @@ function normalizeVotersResponse(response) {
   }
 
   return normalized;
+}
+
+function extractAccessToken(rawUrl) {
+  const directMatch = rawUrl.match(/access_token=([^&\s]+)/i);
+  if (directMatch) {
+    return decodeURIComponent(directMatch[1]);
+  }
+
+  try {
+    const parsed = new URL(rawUrl);
+    const queryToken = parsed.searchParams.get('access_token');
+    if (queryToken) {
+      return queryToken;
+    }
+
+    const hash = parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash;
+    const hashParams = new URLSearchParams(hash);
+    const hashToken = hashParams.get('access_token');
+    if (hashToken) {
+      return hashToken;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function upsertEnvVar(content, key, value) {
+  const line = `${key}=${value}`;
+  const pattern = new RegExp(`^${key}=.*$`, 'm');
+
+  if (pattern.test(content)) {
+    return content.replace(pattern, line);
+  }
+
+  const prefix = content.endsWith('\n') || content.length === 0 ? '' : '\n';
+  return `${content}${prefix}${line}\n`;
+}
+
+async function updateUserTokenInEnv(token) {
+  let envContent = '';
+  try {
+    envContent = await fs.readFile(ENV_FILE, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  const next = upsertEnvVar(envContent, 'VK_USER_TOKEN', token);
+  await fs.writeFile(ENV_FILE, next, 'utf8');
+}
+
+function applyUserToken(token) {
+  VK_USER_TOKEN = token;
+  process.env.VK_USER_TOKEN = token;
+  vkUser = token ? new VK({ token }) : null;
 }
 
 async function getPollVotersByAnswer(poll) {
@@ -734,6 +812,45 @@ vk.updates.on('message_new', async (context, next) => {
         message: error?.message
       });
       await context.send('Не получилось создать опрос. Проверьте VK_USER_TOKEN и попробуйте снова.');
+    }
+
+    return;
+  }
+
+  const updateToken = parseUpdateTokenCommand(context.text.trim());
+  if (updateToken) {
+    const senderId = Number(context.senderId ?? context.userId ?? 0);
+    const isChat = Number(context.peerId) >= 2_000_000_000;
+    if (isChat && (!BOT_ADMIN_USER_ID || senderId !== BOT_ADMIN_USER_ID)) {
+      await context.send('Команда /update_token в беседе доступна только админу.');
+      return;
+    }
+
+    if (!updateToken.rawUrl) {
+      await context.send(
+        `Откройте ссылку, авторизуйтесь и отправьте сюда команду:\n` +
+          `/update_token <итоговый_url_с_access_token>\n\n` +
+          `${VK_USER_TOKEN_AUTH_URL}`
+      );
+      return;
+    }
+
+    const token = extractAccessToken(updateToken.rawUrl);
+    if (!token) {
+      await context.send('Не нашел access_token в URL. Проверьте, что вставлен полный URL после авторизации.');
+      return;
+    }
+
+    try {
+      await updateUserTokenInEnv(token);
+      applyUserToken(token);
+      await context.send('VK_USER_TOKEN обновлен и применен без перезапуска.');
+    } catch (error) {
+      console.error('Failed to update VK_USER_TOKEN', {
+        code: error?.code,
+        message: error?.message
+      });
+      await context.send('Не получилось обновить VK_USER_TOKEN в .env');
     }
 
     return;

@@ -11,6 +11,8 @@
   - нет ли конфликтов `Иду` + `Не иду`
   - набрано ли 12+ участников с учетом приглашенных
   - есть ли запас (если больше 12)
+- Команда `/update_token` отправляет OAuth-ссылку для получения токена (только для `BOT_ADMIN_USER_ID`).
+- Команда `/update_token <url>` обновляет `VK_USER_TOKEN` в `.env` и применяет его без перезапуска (только для `BOT_ADMIN_USER_ID`).
 - Если пользователь был в `Иду`/`+1`/`+2`/`+3`, а потом изменил голос и вышел из этих пунктов, бот отправляет в чат с опросом уведомление и тегает пользователя.
   - Уведомление может приходить с небольшой задержкой, так как есть фоновая проверка снятых голосов (по умолчанию раз в 60 секунд, настраивается через `POLL_TRACKER_SYNC_MS`).
 - Команда `/createGame <название>` создает опрос в чате:
@@ -30,18 +32,28 @@
 
 ## Подготовка
 
+Как получить `VK_USER_TOKEN` (ручной OAuth):
+
+1. Откройте ссылку в браузере под нужным VK-аккаунтом:
+
+   [https://oauth.vk.com/authorize?client_id=6287487&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=polls,offline&response_type=token&v=5.199](https://oauth.vk.com/authorize?client_id=6287487&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=polls,offline&response_type=token&v=5.199)
+2. После авторизации скопируйте `access_token` из адресной строки.
+3. Запишите его в `.env` как `VK_USER_TOKEN=...`.
+
 1. Создайте сообщество/бота ВК и получите `VK_TOKEN`.
 2. Получите пользовательский токен `VK_USER_TOKEN` (именно user token), он нужен для чтения голосов в опросе (`polls.getVoters`).
 3. Включите Callback API и Long Poll для группы.
    - В типах событий Long Poll включите `poll_vote_new` (нужно для авто-уведомлений при смене голоса).
 4. Дайте права group-токену минимум на: `messages`.
 5. Разрешите боту писать в беседу.
+6. Укажите `BOT_ADMIN_USER_ID` в `.env`, чтобы работала команда `/update_token`.
+7. При необходимости укажите `VK_USER_TOKEN_AUTH_URL` в `.env` (если хотите свою OAuth-ссылку).
 
 ## Установка
 
 ```bash
 cp .env.example .env
-# впишите VK_TOKEN и VK_USER_TOKEN в .env
+# впишите VK_TOKEN, VK_USER_TOKEN и BOT_ADMIN_USER_ID в .env
 npm install
 npm start
 ```
@@ -62,6 +74,13 @@ npm start
 
 ```text
 /createGame Волейбол в четверг 20:00
+```
+
+Обновить `VK_USER_TOKEN` из итогового OAuth URL:
+
+```text
+/update_token
+/update_token https://oauth.vk.com/blank.html#access_token=...
 ```
 
 ## Хранилище
