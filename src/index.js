@@ -691,15 +691,15 @@ vk.updates.on('message_new', async (context, next) => {
 
     try {
       const poll = await createGamePoll(createGame.title);
+      const sent = await context.send({
+        message: `Опрос создан: ${createGame.title}`,
+        attachment: poll.attachment
+      });
       const pollFull = await vkUser.api.polls.getById({
         owner_id: poll.ownerId,
         poll_id: poll.pollId
       });
-      await registerPollTracker(pollFull, context.peerId);
-      await context.send({
-        message: `Опрос создан: ${createGame.title}`,
-        attachment: poll.attachment
-      });
+      await registerPollTracker(pollFull, context.peerId, Number(sent?.id ?? 0));
     } catch (error) {
       if (error?.code === 'MISSING_USER_TOKEN') {
         await context.send(
