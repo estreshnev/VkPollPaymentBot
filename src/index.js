@@ -216,6 +216,7 @@ async function registerPollTracker(poll, peerId, replyToMessageId = 0) {
   const tracker = state.pollTrackers[key] ?? {
     ownerId,
     pollId,
+    pollTitle: '',
     peerIds: [],
     trackedAnswerIds: [],
     userFlags: {},
@@ -223,6 +224,7 @@ async function registerPollTracker(poll, peerId, replyToMessageId = 0) {
   };
 
   tracker.trackedAnswerIds = trackedAnswerIds;
+  tracker.pollTitle = String(poll.question ?? tracker.pollTitle ?? '');
   const peer = Number(peerId);
   if (!tracker.peerIds.includes(peer)) {
     tracker.peerIds.push(peer);
@@ -252,19 +254,38 @@ async function registerPollTracker(poll, peerId, replyToMessageId = 0) {
 async function notifyVoteChangeToNonTracked(ownerId, pollId, userId, tracker) {
   const usersMap = await getUsersMap([userId]);
   const mention = makeMention(userId, usersMap);
-  const message = `${mention}, ты изменил голос, не забудьте проверить опрос.`;
+  const pollTitle = tracker.pollTitle || `poll${ownerId}_${pollId}`;
+  const message = `${mention}, ты изменил голос в опросе «${pollTitle}», не забудьте проверить опрос.`;
   const peerIds = tracker.peerIds ?? [];
   const replyToMessageId = Number(tracker.replyToMessageId ?? 0);
 
   for (const peerId of peerIds) {
+    const baseParams = {
+      peer_id: Number(peerId),
+      random_id: Date.now() + Number(peerId),
+      message
+    };
+
     try {
       await vk.api.messages.send({
-        peer_id: Number(peerId),
-        random_id: Date.now() + Number(peerId),
-        message,
+        ...baseParams,
         ...(replyToMessageId > 0 ? { reply_to: replyToMessageId } : {})
       });
     } catch (error) {
+      if (replyToMessageId > 0 && error?.code === 100) {
+        try {
+          await vk.api.messages.send(baseParams);
+          continue;
+        } catch (fallbackError) {
+          console.error('Failed to notify vote change (fallback)', {
+            code: fallbackError?.code,
+            message: fallbackError?.message,
+            peerId
+          });
+          continue;
+        }
+      }
+
       console.error('Failed to notify vote change', {
         code: error?.code,
         message: error?.message,
@@ -699,7 +720,7 @@ vk.updates.on('message_new', async (context, next) => {
         owner_id: poll.ownerId,
         poll_id: poll.pollId
       });
-      await registerPollTracker(pollFull, context.peerId, Number(sent?.id ?? 0));
+      await registerPollTracker(pollFull, context.peerId);
     } catch (error) {
       if (error?.code === 'MISSING_USER_TOKEN') {
         await context.send(
