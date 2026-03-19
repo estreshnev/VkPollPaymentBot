@@ -30,6 +30,7 @@ const HELP_TEXT = [
   'Команды бота:',
   '/ping - проверка, что бот онлайн',
   '/createGame <название> - создать игровой опрос',
+  '/check - проверить опрос (команду отправлять ответом на сообщение с опросом)',
   '/getMoney <текст_оплаты> - запустить сбор по опросу (команду отправлять ответом на сообщение с опросом)',
   '',
   'Как пользоваться:',
@@ -84,6 +85,10 @@ function parseCreateGameCommand(text) {
   };
 }
 
+function isCheckCommand(text) {
+  return /^\/check(?:\s+.*)?$/i.test(text.trim());
+}
+
 function extractPollAttachment(message) {
   if (!message || !Array.isArray(message.attachments)) {
     return null;
@@ -104,6 +109,10 @@ function extractPositiveInteger(optionText) {
 
 function isGoingOption(optionText) {
   return optionText.trim().toLowerCase() === 'иду';
+}
+
+function isNotGoingOption(optionText) {
+  return optionText.trim().toLowerCase() === 'не иду';
 }
 
 function normalizeVotersResponse(response) {
@@ -234,7 +243,11 @@ async function createGamePoll(title) {
     ...(greenBackgroundId ? { background_id: greenBackgroundId } : {})
   });
 
-  return `poll${poll.owner_id}_${poll.id}`;
+  return {
+    ownerId: Number(poll.owner_id),
+    pollId: Number(poll.id),
+    attachment: `poll${poll.owner_id}_${poll.id}`
+  };
 }
 
 function buildUnpaidParticipants({ poll, votersByAnswer }) {
@@ -267,6 +280,79 @@ function buildUnpaidParticipants({ poll, votersByAnswer }) {
     unpaidSelf: Array.from(unpaidSelf),
     invitedByUser
   };
+}
+
+function buildCheckStats({ poll, votersByAnswer }) {
+  const going = new Set();
+  const notGoing = new Set();
+  let invitedTotal = 0;
+
+  for (const answer of poll.answers ?? []) {
+    const answerId = Number(answer.id);
+    const answerText = String(answer.text ?? '').trim();
+    const voters = votersByAnswer[answerId] ?? [];
+
+    if (isGoingOption(answerText)) {
+      for (const userId of voters) {
+        going.add(userId);
+      }
+      continue;
+    }
+
+    if (isNotGoingOption(answerText)) {
+      for (const userId of voters) {
+        notGoing.add(userId);
+      }
+      continue;
+    }
+
+    const invitedCount = extractPositiveInteger(answerText);
+    if (invitedCount <= 0) {
+      continue;
+    }
+
+    invitedTotal += voters.length * invitedCount;
+  }
+
+  const conflictUserIds = [...going].filter((userId) => notGoing.has(userId));
+  const totalParticipants = going.size + invitedTotal;
+
+  return {
+    conflictUserIds,
+    totalParticipants
+  };
+}
+
+function renderCheckMessage({ pollTitle, stats, usersMap }) {
+  const lines = [];
+  lines.push(`Проверка опроса: ${pollTitle}`);
+  lines.push('');
+
+  if (stats.conflictUserIds.length === 0) {
+    lines.push('1) Конфликтов «Иду» + «Не иду» нет.');
+  } else {
+    lines.push('1) Нашел конфликт «Иду» + «Не иду» у:');
+    for (const userId of stats.conflictUserIds) {
+      lines.push(`• ${makeMention(userId, usersMap)}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`2) Всего участников (с приглашенными): ${stats.totalParticipants}.`);
+  if (stats.totalParticipants >= 12) {
+    lines.push('Минимум 12 набрано.');
+  } else {
+    lines.push(`До 12 не хватает: ${12 - stats.totalParticipants}.`);
+  }
+
+  lines.push('');
+  if (stats.totalParticipants > 12) {
+    lines.push('3) У нас есть запас, если кто-то хочет отмениться — не забудьте оповестить запасного.');
+  } else {
+    lines.push('3) Запаса пока нет.');
+  }
+
+  return lines.join('\n');
 }
 
 async function getUsersMap(userIds) {
@@ -419,10 +505,10 @@ vk.updates.on('message_new', async (context, next) => {
     }
 
     try {
-      const attachment = await createGamePoll(createGame.title);
+      const poll = await createGamePoll(createGame.title);
       await context.send({
         message: `Опрос создан: ${createGame.title}`,
-        attachment
+        attachment: poll.attachment
       });
     } catch (error) {
       if (error?.code === 'MISSING_USER_TOKEN') {
@@ -437,6 +523,55 @@ vk.updates.on('message_new', async (context, next) => {
         message: error?.message
       });
       await context.send('Не получилось создать опрос. Проверьте VK_USER_TOKEN и попробуйте снова.');
+    }
+
+    return;
+  }
+
+  if (isCheckCommand(context.text)) {
+    const replyMessage = context.message.reply_message;
+    if (!replyMessage) {
+      await context.send('Команду /check нужно отправить ответом на сообщение с опросом.');
+      return;
+    }
+
+    const poll = extractPollAttachment(replyMessage);
+    if (!poll) {
+      await context.send('В сообщении, на которое вы ответили, не найден опрос.');
+      return;
+    }
+
+    try {
+      const votersByAnswer = await getPollVotersByAnswer(poll);
+      const stats = buildCheckStats({ poll, votersByAnswer });
+      const usersMap = await getUsersMap(stats.conflictUserIds);
+      const message = renderCheckMessage({
+        pollTitle: String(poll.question ?? 'Без названия'),
+        stats,
+        usersMap
+      });
+      await context.send(message);
+    } catch (error) {
+      if (error?.code === 'MISSING_USER_TOKEN') {
+        await context.send(
+          'Для проверки опроса нужен user-токен. Добавьте VK_USER_TOKEN в .env и перезапустите бота.'
+        );
+        return;
+      }
+
+      if (error?.code === 27) {
+        await context.send(
+          'Не удалось прочитать голоса опроса: метод polls.getVoters недоступен для group-токена. ' +
+            'Нужен VK_USER_TOKEN в .env.'
+        );
+        return;
+      }
+
+      console.error('Failed to check poll', {
+        code: error?.code,
+        message: error?.message
+      });
+      await context.send('Не получилось проверить опрос. Проверьте настройки токенов и попробуйте снова.');
     }
 
     return;
