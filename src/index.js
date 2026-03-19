@@ -16,6 +16,10 @@ if (!VK_TOKEN) {
 }
 const VK_USER_TOKEN = process.env.VK_USER_TOKEN;
 const DEBUG_EVENTS = process.env.DEBUG_EVENTS === '1';
+const POLL_TRACKER_SYNC_MS = Math.max(
+  10_000,
+  Number.parseInt(process.env.POLL_TRACKER_SYNC_MS ?? '60000', 10) || 60_000
+);
 
 const vk = new VK({ token: VK_TOKEN });
 const vkUser = VK_USER_TOKEN ? new VK({ token: VK_USER_TOKEN }) : null;
@@ -35,12 +39,17 @@ const HELP_TEXT = [
   '',
   'Как пользоваться:',
   '1) Создайте опрос через /createGame (или используйте уже готовый).',
-  '2) Когда игра прошла, ответьте на сообщение с опросом командой /getMoney.',
-  '3) Участники нажимают "Оплатил", а пригласившие используют "Оплатил приглашенный".'
+  '2) Для быстрой проверки отправьте /check ответом на опрос.',
+  '3) Для сбора денег отправьте /getMoney ответом на опрос.',
+  '4) Бот автоматически напишет в чат, если человек вышел из пунктов Иду/+1/+2/+3.',
+  '',
+  'Пример:',
+  '/getMoney 500р перевод на 8-999-123-45-67'
 ].join('\n');
 
-let state = { collections: {} };
+let state = { collections: {}, pollTrackers: {} };
 let cachedGreenBackgroundId = null;
+let trackerSyncInProgress = false;
 
 async function ensureStateLoaded() {
   try {
@@ -48,6 +57,9 @@ async function ensureStateLoaded() {
     state = JSON.parse(raw);
     if (!state.collections || typeof state.collections !== 'object') {
       state.collections = {};
+    }
+    if (!state.pollTrackers || typeof state.pollTrackers !== 'object') {
+      state.pollTrackers = {};
     }
   } catch (error) {
     if (error.code === 'ENOENT') {
@@ -115,6 +127,14 @@ function isNotGoingOption(optionText) {
   return optionText.trim().toLowerCase() === 'не иду';
 }
 
+function isTrackedGameOption(optionText) {
+  return isGoingOption(optionText) || extractPositiveInteger(optionText) > 0;
+}
+
+function pollKey(ownerId, pollId) {
+  return `${ownerId}_${pollId}`;
+}
+
 function normalizeVotersResponse(response) {
   const normalized = {};
 
@@ -158,6 +178,170 @@ async function getPollVotersByAnswer(poll) {
   });
 
   return normalizeVotersResponse(raw);
+}
+
+async function getPollVotersByAnswerIds(ownerId, pollId, answerIds) {
+  if (!vkUser) {
+    const error = new Error('VK_USER_TOKEN is required to read poll voters via polls.getVoters');
+    error.code = 'MISSING_USER_TOKEN';
+    throw error;
+  }
+
+  if (!Array.isArray(answerIds) || answerIds.length === 0) {
+    return {};
+  }
+
+  const raw = await vkUser.api.polls.getVoters({
+    owner_id: ownerId,
+    poll_id: pollId,
+    answer_ids: answerIds.join(',')
+  });
+
+  return normalizeVotersResponse(raw);
+}
+
+function extractTrackedAnswerIds(poll) {
+  return (poll.answers ?? [])
+    .filter((answer) => isTrackedGameOption(String(answer.text ?? '').trim()))
+    .map((answer) => Number(answer.id))
+    .filter((id) => Number.isFinite(id));
+}
+
+async function registerPollTracker(poll, peerId, replyToMessageId = 0) {
+  const ownerId = Number(poll.owner_id);
+  const pollId = Number(poll.id);
+  const key = pollKey(ownerId, pollId);
+  const trackedAnswerIds = extractTrackedAnswerIds(poll);
+
+  const tracker = state.pollTrackers[key] ?? {
+    ownerId,
+    pollId,
+    peerIds: [],
+    trackedAnswerIds: [],
+    userFlags: {},
+    replyToMessageId: 0
+  };
+
+  tracker.trackedAnswerIds = trackedAnswerIds;
+  const peer = Number(peerId);
+  if (!tracker.peerIds.includes(peer)) {
+    tracker.peerIds.push(peer);
+  }
+  if (Number(replyToMessageId) > 0) {
+    tracker.replyToMessageId = Number(replyToMessageId);
+  }
+
+  const votersByAnswer = await getPollVotersByAnswerIds(ownerId, pollId, trackedAnswerIds);
+  const currentTrackedUsers = new Set();
+  for (const answerId of trackedAnswerIds) {
+    for (const userId of votersByAnswer[answerId] ?? []) {
+      currentTrackedUsers.add(Number(userId));
+    }
+  }
+
+  const nextFlags = {};
+  for (const userId of currentTrackedUsers) {
+    nextFlags[userId] = true;
+  }
+  tracker.userFlags = nextFlags;
+
+  state.pollTrackers[key] = tracker;
+  await saveState();
+}
+
+async function notifyVoteChangeToNonTracked(ownerId, pollId, userId, tracker) {
+  const usersMap = await getUsersMap([userId]);
+  const mention = makeMention(userId, usersMap);
+  const message = `${mention}, ты изменил голос, не забудьте проверить опрос.`;
+  const peerIds = tracker.peerIds ?? [];
+  const replyToMessageId = Number(tracker.replyToMessageId ?? 0);
+
+  for (const peerId of peerIds) {
+    try {
+      await vk.api.messages.send({
+        peer_id: Number(peerId),
+        random_id: Date.now() + Number(peerId),
+        message,
+        ...(replyToMessageId > 0 ? { reply_to: replyToMessageId } : {})
+      });
+    } catch (error) {
+      console.error('Failed to notify vote change', {
+        code: error?.code,
+        message: error?.message,
+        peerId
+      });
+    }
+  }
+}
+
+async function getTrackedUsersSet(tracker) {
+  const votersByAnswer = await getPollVotersByAnswerIds(
+    tracker.ownerId,
+    tracker.pollId,
+    tracker.trackedAnswerIds ?? []
+  );
+  const users = new Set();
+
+  for (const answerId of tracker.trackedAnswerIds ?? []) {
+    for (const userId of votersByAnswer[Number(answerId)] ?? []) {
+      users.add(Number(userId));
+    }
+  }
+
+  return users;
+}
+
+async function syncPollTrackers() {
+  if (trackerSyncInProgress || !vkUser) {
+    return;
+  }
+  trackerSyncInProgress = true;
+
+  try {
+    let changed = false;
+    const trackerEntries = Object.entries(state.pollTrackers ?? {});
+
+    for (const [key, tracker] of trackerEntries) {
+      if (!tracker || !Array.isArray(tracker.trackedAnswerIds) || tracker.trackedAnswerIds.length === 0) {
+        continue;
+      }
+
+      const currentUsers = await getTrackedUsersSet(tracker);
+      const previousFlags = tracker.userFlags ?? {};
+      const allUserIds = new Set([
+        ...Object.keys(previousFlags).map((id) => Number(id)),
+        ...currentUsers
+      ]);
+
+      for (const userId of allUserIds) {
+        const wasTracked = Boolean(previousFlags[userId]);
+        const isTracked = currentUsers.has(userId);
+
+        if (wasTracked && !isTracked) {
+          await notifyVoteChangeToNonTracked(tracker.ownerId, tracker.pollId, userId, tracker);
+        }
+
+        if (!tracker.userFlags || typeof tracker.userFlags !== 'object') {
+          tracker.userFlags = {};
+        }
+        tracker.userFlags[userId] = isTracked;
+      }
+
+      state.pollTrackers[key] = tracker;
+      changed = true;
+    }
+
+    if (changed) {
+      await saveState();
+    }
+  } catch (error) {
+    console.error('Failed to sync poll trackers', {
+      code: error?.code,
+      message: error?.message
+    });
+  } finally {
+    trackerSyncInProgress = false;
+  }
 }
 
 function parseHexColor(hex) {
@@ -507,6 +691,11 @@ vk.updates.on('message_new', async (context, next) => {
 
     try {
       const poll = await createGamePoll(createGame.title);
+      const pollFull = await vkUser.api.polls.getById({
+        owner_id: poll.ownerId,
+        poll_id: poll.pollId
+      });
+      await registerPollTracker(pollFull, context.peerId);
       await context.send({
         message: `Опрос создан: ${createGame.title}`,
         attachment: poll.attachment
@@ -543,6 +732,8 @@ vk.updates.on('message_new', async (context, next) => {
     }
 
     try {
+      await registerPollTracker(poll, context.peerId, Number(replyMessage.id ?? 0));
+
       const votersByAnswer = await getPollVotersByAnswer(poll);
       const stats = buildCheckStats({ poll, votersByAnswer });
       const usersMap = await getUsersMap(stats.conflictUserIds);
@@ -600,6 +791,8 @@ vk.updates.on('message_new', async (context, next) => {
   }
 
   try {
+    await registerPollTracker(poll, context.peerId, Number(replyMessage.id ?? 0));
+
     const votersByAnswer = await getPollVotersByAnswer(poll);
     const participants = buildUnpaidParticipants({ poll, votersByAnswer });
 
@@ -659,6 +852,46 @@ vk.updates.on('message_new', async (context, next) => {
       message: error?.message
     });
     await context.send('Не получилось обработать опрос. Проверьте настройки токенов и попробуйте снова.');
+  }
+});
+
+vk.updates.on('poll_vote_new', async (context) => {
+  if (!vkUser) {
+    return;
+  }
+
+  try {
+    const ownerId = Number(context.ownerId);
+    const pollId = Number(context.id);
+    const userId = Number(context.userId);
+    const key = pollKey(ownerId, pollId);
+    const tracker = state.pollTrackers[key];
+
+    if (!tracker || !Array.isArray(tracker.trackedAnswerIds) || tracker.trackedAnswerIds.length === 0) {
+      return;
+    }
+
+    const previousState = Boolean(tracker.userFlags?.[userId]);
+    const votersByAnswer = await getPollVotersByAnswerIds(ownerId, pollId, tracker.trackedAnswerIds);
+    const isCurrentlyTracked = tracker.trackedAnswerIds.some((answerId) =>
+      (votersByAnswer[Number(answerId)] ?? []).includes(userId)
+    );
+
+    if (!tracker.userFlags || typeof tracker.userFlags !== 'object') {
+      tracker.userFlags = {};
+    }
+    tracker.userFlags[userId] = isCurrentlyTracked;
+    state.pollTrackers[key] = tracker;
+    await saveState();
+
+    if (previousState && !isCurrentlyTracked) {
+      await notifyVoteChangeToNonTracked(ownerId, pollId, userId, tracker);
+    }
+  } catch (error) {
+    console.error('Failed to handle poll_vote_new', {
+      code: error?.code,
+      message: error?.message
+    });
   }
 });
 
@@ -739,5 +972,8 @@ vk.updates.on('message_event', async (context) => {
 (async () => {
   await ensureStateLoaded();
   await vk.updates.start();
+  setInterval(() => {
+    void syncPollTrackers();
+  }, POLL_TRACKER_SYNC_MS);
   console.log('VK Poll Payment Bot started');
 })();
