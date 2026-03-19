@@ -24,8 +24,22 @@ const ACTIONS = {
   PAY_SELF: 'pay_self',
   PAY_INVITED: 'pay_invited'
 };
+const GAME_POLL_ANSWERS = ['Иду', '+1', '+2', '+3', 'Не иду'];
+const POLL_BACKGROUND_IDS = new Set(['0', '1', '2', '3', '4', '6', '8', '9']);
+const HELP_TEXT = [
+  'Команды бота:',
+  '/ping - проверка, что бот онлайн',
+  '/createGame <название> - создать игровой опрос',
+  '/getMoney <текст_оплаты> - запустить сбор по опросу (команду отправлять ответом на сообщение с опросом)',
+  '',
+  'Как пользоваться:',
+  '1) Создайте опрос через /createGame (или используйте уже готовый).',
+  '2) Когда игра прошла, ответьте на сообщение с опросом командой /getMoney.',
+  '3) Участники нажимают "Оплатил", а пригласившие используют "Оплатил приглашенный".'
+].join('\n');
 
 let state = { collections: {} };
+let cachedGreenBackgroundId = null;
 
 async function ensureStateLoaded() {
   try {
@@ -56,6 +70,17 @@ function parseGetMoneyCommand(text) {
 
   return {
     paymentText: match[1].trim()
+  };
+}
+
+function parseCreateGameCommand(text) {
+  const match = text.match(/^\/creategame\s+(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    title: match[1].trim()
   };
 }
 
@@ -124,6 +149,92 @@ async function getPollVotersByAnswer(poll) {
   });
 
   return normalizeVotersResponse(raw);
+}
+
+function parseHexColor(hex) {
+  const value = String(hex || '').trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(value)) {
+    return null;
+  }
+
+  return {
+    r: Number.parseInt(value.slice(0, 2), 16),
+    g: Number.parseInt(value.slice(2, 4), 16),
+    b: Number.parseInt(value.slice(4, 6), 16)
+  };
+}
+
+function getGreenScore(hex) {
+  const rgb = parseHexColor(hex);
+  if (!rgb) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  // Prefer colors where green channel dominates and is bright enough.
+  return (rgb.g - rgb.r) + (rgb.g - rgb.b) + (rgb.g * 0.25);
+}
+
+function pickGreenBackgroundId(backgrounds) {
+  let bestId = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const background of backgrounds ?? []) {
+    const id = String(background?.id ?? '');
+    if (!POLL_BACKGROUND_IDS.has(id)) {
+      continue;
+    }
+
+    const colors = [
+      background?.color,
+      ...(background?.points ?? []).map((point) => point?.color)
+    ];
+    const localBest = Math.max(...colors.map(getGreenScore));
+
+    if (localBest > bestScore) {
+      bestScore = localBest;
+      bestId = id;
+    }
+  }
+
+  return bestId;
+}
+
+async function resolveGreenBackgroundId() {
+  if (cachedGreenBackgroundId) {
+    return cachedGreenBackgroundId;
+  }
+
+  if (!vkUser) {
+    return null;
+  }
+
+  try {
+    const backgrounds = await vkUser.api.polls.getBackgrounds({});
+    cachedGreenBackgroundId = pickGreenBackgroundId(backgrounds);
+    return cachedGreenBackgroundId;
+  } catch {
+    return null;
+  }
+}
+
+async function createGamePoll(title) {
+  if (!vkUser) {
+    const error = new Error('VK_USER_TOKEN is required to create poll via polls.create');
+    error.code = 'MISSING_USER_TOKEN';
+    throw error;
+  }
+
+  const greenBackgroundId = await resolveGreenBackgroundId();
+  const poll = await vkUser.api.polls.create({
+    question: title,
+    add_answers: JSON.stringify(GAME_POLL_ANSWERS),
+    is_anonymous: 0,
+    is_multiple: 1,
+    disable_unvote: 0,
+    ...(greenBackgroundId ? { background_id: greenBackgroundId } : {})
+  });
+
+  return `poll${poll.owner_id}_${poll.id}`;
 }
 
 function buildUnpaidParticipants({ poll, votersByAnswer }) {
@@ -292,6 +403,42 @@ vk.updates.on('message_new', async (context, next) => {
 
   if (context.text.trim().toLowerCase() === '/ping') {
     await context.send('pong');
+    return;
+  }
+
+  if (context.text.trim().toLowerCase() === '/help') {
+    await context.send(HELP_TEXT);
+    return;
+  }
+
+  const createGame = parseCreateGameCommand(context.text.trim());
+  if (createGame) {
+    if (!createGame.title) {
+      await context.send('После /createGame укажите название, например: /createGame Волейбол в четверг');
+      return;
+    }
+
+    try {
+      const attachment = await createGamePoll(createGame.title);
+      await context.send({
+        message: `Опрос создан: ${createGame.title}`,
+        attachment
+      });
+    } catch (error) {
+      if (error?.code === 'MISSING_USER_TOKEN') {
+        await context.send(
+          'Для создания опроса нужен user-токен. Добавьте VK_USER_TOKEN в .env и перезапустите бота.'
+        );
+        return;
+      }
+
+      console.error('Failed to create game poll', {
+        code: error?.code,
+        message: error?.message
+      });
+      await context.send('Не получилось создать опрос. Проверьте VK_USER_TOKEN и попробуйте снова.');
+    }
+
     return;
   }
 
