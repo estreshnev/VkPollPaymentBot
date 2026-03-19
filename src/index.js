@@ -347,9 +347,10 @@ function renderCheckMessage({ pollTitle, stats, usersMap }) {
 
   lines.push('');
   if (stats.totalParticipants > 12) {
-    lines.push('3) У нас есть запас, если кто-то хочет отмениться — не забудьте оповестить запасного.');
+    const reserveCount = stats.totalParticipants - 12;
+    lines.push(`3) ${reserveCount} запасных - если отменяетесь не забудьте оповестить того, кто в запасе.`);
   } else {
-    lines.push('3) Ок.');
+    lines.push('3) Запасных нет.');
   }
 
   return lines.join('\n');
